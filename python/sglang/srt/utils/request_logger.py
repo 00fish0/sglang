@@ -221,13 +221,14 @@ class RequestLogger:
                 max_length = 1 << 30
                 skip_names = {
                     "text",
-                    "input_ids",
+                    # "input_ids",
                     "input_embeds",
                     "image_data",
                     "audio_data",
                     "lora_path",
                 }
-                out_skip_names = {"text", "output_ids", "embedding"}
+                # out_skip_names = {"text", "output_ids", "embedding"}
+                out_skip_names = {"text", "embedding"}
             elif self.log_requests_level == 2:
                 max_length = 2048
             elif self.log_requests_level == 3:

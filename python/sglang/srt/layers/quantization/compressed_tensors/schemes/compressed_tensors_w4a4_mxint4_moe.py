@@ -352,6 +352,6 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
             routing_method_type=routing_method_type,
             tune_max_num_tokens=next_power_of_2(x.shape[0]),
             output=symm_output,
-        )
+        )[0]
 
         return StandardCombineInput(hidden_states=output)

@@ -9,6 +9,58 @@ from partial_json_parser.core.options import Allow
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
 
+def _ensure_non_empty_constraints(schema: Any) -> Any:
+    """Recursively add non-empty constraints without overriding explicit schema bounds."""
+    if isinstance(schema, list):
+        return [_ensure_non_empty_constraints(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    updated = dict(schema)
+
+    schema_type = updated.get("type")
+    if isinstance(schema_type, list):
+        non_null_types = [t for t in schema_type if t != "null"]
+    elif isinstance(schema_type, str):
+        non_null_types = [schema_type]
+    else:
+        non_null_types = []
+
+    if "string" in non_null_types:
+        updated.setdefault("minLength", 1)
+    if "array" in non_null_types:
+        updated.setdefault("items", {})
+        updated.setdefault("minItems", 1)
+        updated["items"] = _ensure_non_empty_constraints(updated["items"])
+    if "object" in non_null_types or "properties" in updated:
+        if "properties" in updated and isinstance(updated["properties"], dict):
+            updated["properties"] = {
+                key: _ensure_non_empty_constraints(value)
+                for key, value in updated["properties"].items()
+            }
+
+    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        if key in updated and isinstance(updated[key], list):
+            updated[key] = [_ensure_non_empty_constraints(item) for item in updated[key]]
+
+    if "$defs" in updated and isinstance(updated["$defs"], dict):
+        updated["$defs"] = {
+            key: _ensure_non_empty_constraints(value)
+            for key, value in updated["$defs"].items()
+        }
+
+    if "definitions" in updated and isinstance(updated["definitions"], dict):
+        updated["definitions"] = {
+            key: _ensure_non_empty_constraints(value)
+            for key, value in updated["definitions"].items()
+        }
+
+    if "not" in updated:
+        updated["not"] = _ensure_non_empty_constraints(updated["not"])
+
+    return updated
+
+
 def _find_common_prefix(s1: str, s2: str) -> str:
     prefix = ""
     min_length = min(len(s1), len(s2))
@@ -92,7 +144,7 @@ def _get_tool_schema(tool: Tool) -> dict:
         "properties": {
             "name": {"type": "string", "enum": [tool.function.name]},
             "parameters": (
-                tool.function.parameters
+                _ensure_non_empty_constraints(tool.function.parameters)
                 if tool.function.parameters
                 else {"type": "object", "properties": {}}
             ),

@@ -31,7 +31,10 @@ from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.trinity_detector import TrinityDetector
-from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.function_call.utils import (
+    _ensure_non_empty_constraints,
+    get_json_schema_constraint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +167,7 @@ class FunctionCallParser:
             is_strict = (
                 function.strict or self.tool_strict_level >= ToolStrictLevel.PARAMETER
             )
-            schema = function.parameters if is_strict else {}
+            schema = _ensure_non_empty_constraints(function.parameters) if is_strict and function.parameters else {}
 
             tool_structures.append(
                 StructuresResponseFormat(

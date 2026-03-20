@@ -16,6 +16,7 @@
 import dataclasses
 import json
 import logging
+from threading import Lock, local
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -204,10 +205,22 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     f"Failed to create XGrammar TokenizerInfo from tokenizer: {e}"
                 )
 
-        self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        self.tokenizer_info = tokenizer_info
+        self._thread_local = local()
+        self._compiler_registry_lock = Lock()
+        self._compiler_registry: List[GrammarCompiler] = []
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
+
+    def _get_thread_local_compiler(self) -> GrammarCompiler:
+        compiler = getattr(self._thread_local, "grammar_compiler", None)
+        if compiler is None:
+            compiler = GrammarCompiler(tokenizer_info=self.tokenizer_info)
+            self._thread_local.grammar_compiler = compiler
+            with self._compiler_registry_lock:
+                self._compiler_registry.append(compiler)
+        return compiler
 
     @staticmethod
     def _sanitize_structural_format(structural_format):
@@ -255,13 +268,15 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         )
 
     def dispatch_json(self, key_string: str) -> BaseGrammarObject:
+        compiler = self._get_thread_local_compiler()
         try:
             if key_string == "$$ANY$$":
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
-                ctx = self.grammar_compiler.compile_builtin_json_grammar()
+                ctx = compiler.compile_builtin_json_grammar()
             else:
-                ctx = self.grammar_compiler.compile_json_schema(
-                    schema=key_string, any_whitespace=self.any_whitespace
+                ctx = compiler.compile_json_schema(
+                    schema=key_string,
+                    any_whitespace=self.any_whitespace,
                 )
 
         except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError) as e:
@@ -270,22 +285,25 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))
 
     def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
+        compiler = self._get_thread_local_compiler()
         try:
-            ctx = self.grammar_compiler.compile_grammar(key_string)
+            ctx = compiler.compile_grammar(key_string)
         except RuntimeError as e:
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
 
     def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
+        compiler = self._get_thread_local_compiler()
         try:
-            ctx = self.grammar_compiler.compile_regex(key_string)
+            ctx = compiler.compile_regex(key_string)
         except RuntimeError as e:
             logger.error(f"Hit invalid regex: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="regex"))
 
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
+        compiler = self._get_thread_local_compiler()
         try:
             # TODO(dark): it's REALLY stupid to construct object from string and decode it again
             structural_tag = json.loads(key_string)
@@ -299,16 +317,14 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     )
                     for structure in structural_tag["structures"]
                 ]
-                ctx = self.grammar_compiler.compile_structural_tag(
-                    tags, structural_tag["triggers"]
-                )
+                ctx = compiler.compile_structural_tag(tags, structural_tag["triggers"])
             else:
                 format_dict = structural_tag.get("format")
                 if isinstance(format_dict, dict):
                     self._sanitize_structural_format(format_dict)
                     structural_tag["format"] = format_dict
                     key_string = json.dumps(structural_tag)
-                ctx = self.grammar_compiler.compile_structural_tag(key_string)
+                ctx = compiler.compile_structural_tag(key_string)
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
@@ -317,7 +333,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         )
 
     def reset(self):
-        self.grammar_compiler.clear_cache()
+        with self._compiler_registry_lock:
+            for compiler in self._compiler_registry:
+                compiler.clear_cache()
 
 
 def demo_test():
