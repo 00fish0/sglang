@@ -1,5 +1,6 @@
 import abc
 import logging
+import os
 import threading
 from collections import defaultdict
 from functools import wraps
@@ -132,6 +133,39 @@ ALLOC_MEMORY_FUNCS = defaultdict(
         "npu": alloc_with_pin_memory,
     },
 )
+
+
+def _fallback_backup_lf_pf_mla(device_pool, host_pool, device_indices, host_indices):
+    """Fallback for MLA page_first_direct backup using per-page cudaMemcpyAsync
+    instead of cudaMemcpyBatchAsync (workaround for CUDA 12.8 batch API segfault
+    with Mooncake-allocated host memory)."""
+    page_size = host_pool.page_size
+    num_pages = len(device_indices) // page_size
+    layer_num = len(device_pool.kv_buffer)
+    for i in range(num_pages):
+        s_idx = int(device_indices[i * page_size])
+        d_idx = int(host_indices[i * page_size]) // page_size
+        for j in range(layer_num):
+            host_pool.kv_buffer[d_idx, j].copy_(
+                device_pool.kv_buffer[j][s_idx : s_idx + page_size]
+            )
+
+
+def _fallback_backup_lf_pf_mha(device_pool, host_pool, device_indices, host_indices):
+    """Fallback for MHA page_first_direct backup (same workaround as MLA)."""
+    page_size = host_pool.page_size
+    num_pages = len(device_indices) // page_size
+    layer_num = len(device_pool.k_buffer)
+    for i in range(num_pages):
+        s_idx = int(device_indices[i * page_size])
+        d_idx = int(host_indices[i * page_size]) // page_size
+        for j in range(layer_num):
+            host_pool.k_buffer[d_idx, j].copy_(
+                device_pool.k_buffer[j][s_idx : s_idx + page_size]
+            )
+            host_pool.v_buffer[d_idx, j].copy_(
+                device_pool.v_buffer[j][s_idx : s_idx + page_size]
+            )
 
 
 class HostKVCache(abc.ABC):
@@ -539,13 +573,18 @@ class MHATokenToKVPoolHost(HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
-                transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=device_pool.k_buffer + device_pool.v_buffer,
-                    dst_ptrs=[self.k_buffer, self.v_buffer],
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    page_size=self.page_size,
-                )
+                if os.environ.get("SGLANG_DISABLE_CUDA_BATCH_MEMCPY"):
+                    _fallback_backup_lf_pf_mha(
+                        device_pool, self, device_indices, host_indices
+                    )
+                else:
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=device_pool.k_buffer + device_pool.v_buffer,
+                        dst_ptrs=[self.k_buffer, self.v_buffer],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        page_size=self.page_size,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
@@ -951,13 +990,18 @@ class MLATokenToKVPoolHost(HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
-                transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=device_pool.kv_buffer,
-                    dst_ptrs=[self.kv_buffer],
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    page_size=self.page_size,
-                )
+                if os.environ.get("SGLANG_DISABLE_CUDA_BATCH_MEMCPY"):
+                    _fallback_backup_lf_pf_mla(
+                        device_pool, self, device_indices, host_indices
+                    )
+                else:
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=device_pool.kv_buffer,
+                        dst_ptrs=[self.kv_buffer],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        page_size=self.page_size,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
