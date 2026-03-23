@@ -3,7 +3,7 @@ import logging
 import threading
 from collections import defaultdict
 from functools import wraps
-from typing import Optional
+from typing import List, Optional
 
 import psutil
 import torch
@@ -1256,3 +1256,26 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         self._backup_indexer_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
         )
+
+    def get_indexer_page_views(self, host_indices: torch.Tensor) -> List[torch.Tensor]:
+        if host_indices.numel() == 0:
+            return []
+        if host_indices.numel() % self.page_size != 0:
+            raise ValueError(
+                "Index buffer transfer expects page-aligned indices for NSA."
+            )
+        if self.layout not in ["page_first", "page_first_direct"]:
+            raise ValueError(
+                "Direct NSA indexer storage requires page_first/page_first_direct "
+                f"layout, got {self.layout}."
+            )
+
+        host_page_indices = (
+            host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+        )
+        if host_page_indices.device.type != "cpu":
+            host_page_indices = host_page_indices.cpu()
+        return [
+            self.index_k_with_scale_buffer[page_idx]
+            for page_idx in host_page_indices.tolist()
+        ]

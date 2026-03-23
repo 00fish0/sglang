@@ -15,8 +15,13 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    NSAExtraStorageMixin,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
+from sglang.srt.mem_cache.memory_pool_host import (
+    HostKVCache,
+    HostTensorAllocator,
+    NSATokenToKVPoolHost,
+)
 from sglang.srt.metrics.collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -222,7 +227,7 @@ class MooncakeStoreConfig:
         )
 
 
-class MooncakeStore(HiCacheStorage):
+class MooncakeStore(NSAExtraStorageMixin, HiCacheStorage):
 
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
@@ -423,6 +428,27 @@ class MooncakeStore(HiCacheStorage):
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
 
+        if isinstance(self.mem_pool_host, NSATokenToKVPoolHost):
+            try:
+                idx_buf = self.mem_pool_host.index_k_with_scale_buffer
+                idx_ptr = idx_buf.data_ptr()
+                idx_size = idx_buf.numel() * idx_buf.element_size()
+                ret_code = self.store.register_buffer(idx_ptr, idx_size)
+                if ret_code:
+                    logger.error(
+                        f"Failed to register NSA indexer buffer, error code: {ret_code}"
+                    )
+                    raise RuntimeError(
+                        f"Failed to register NSA indexer buffer to Mooncake Store, error code: {ret_code}"
+                    )
+            except TypeError as err:
+                logger.error(
+                    "Failed to register NSA indexer buffer to Mooncake Store: %s", err
+                )
+                raise TypeError(
+                    "Mooncake Store Register NSA Indexer Buffer Error."
+                ) from err
+
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
 
@@ -450,6 +476,15 @@ class MooncakeStore(HiCacheStorage):
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
             return self._get_mha_buffer_meta(keys, host_indices)
+
+    def _get_extra_keys_for_nsa(self, keys: List[str]) -> List[str]:
+        if self.is_mla_backend:
+            suffix = self.mla_suffix
+        else:
+            suffix = self.mha_suffix
+        if suffix:
+            return [f"{key}_{suffix}{self._NSA_INDEXER_SUFFIX}" for key in keys]
+        return [f"{key}{self._NSA_INDEXER_SUFFIX}" for key in keys]
 
     def _batch_postprocess(self, results: List[int], is_set_operate=False):
         """
@@ -489,6 +524,25 @@ class MooncakeStore(HiCacheStorage):
         )
         return self._batch_postprocess(get_results, is_set_operate=False)
 
+    def batch_get_extra(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        if len(keys) == 0:
+            return []
+        if self.extra_backend_tag is not None:
+            prefix = self.extra_backend_tag
+            keys = [f"{prefix}_{key}" for key in keys]
+        key_strs = self._get_extra_keys_for_nsa(keys)
+        buffer_ptrs = [buf.data_ptr() for buf in buffers]
+        buffer_sizes = [buf.numel() * buf.element_size() for buf in buffers]
+        get_results = self._get_batch_zero_copy_impl(
+            key_strs, buffer_ptrs, buffer_sizes
+        )
+        return [res > 0 for res in get_results]
+
     def batch_set_v1(
         self,
         keys: List[str],
@@ -526,6 +580,43 @@ class MooncakeStore(HiCacheStorage):
                 set_results[set_indices[i]] = put_results[i]
 
         return self._batch_postprocess(set_results, is_set_operate=True)
+
+    def batch_set_extra(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        if len(keys) == 0:
+            return []
+        if self.extra_backend_tag is not None:
+            prefix = self.extra_backend_tag
+            keys = [f"{prefix}_{key}" for key in keys]
+        key_strs = self._get_extra_keys_for_nsa(keys)
+        exist_result = self._batch_exist(key_strs)
+
+        set_keys = []
+        set_indices = []
+        set_results = [-1] * len(key_strs)
+        for i in range(len(key_strs)):
+            if exist_result[i] != 1:
+                set_keys.append(key_strs[i])
+                set_indices.append(i)
+            else:
+                set_results[i] = 0
+
+        if len(set_keys) > 0:
+            set_buffer_ptrs = [buffers[i].data_ptr() for i in set_indices]
+            set_buffer_sizes = [
+                buffers[i].numel() * buffers[i].element_size() for i in set_indices
+            ]
+            put_results = self._put_batch_zero_copy_impl(
+                set_keys, set_buffer_ptrs, set_buffer_sizes
+            )
+            for i in range(len(set_indices)):
+                set_results[set_indices[i]] = put_results[i]
+
+        return [res == 0 for res in set_results]
 
     def set(
         self,
@@ -671,6 +762,19 @@ class MooncakeStore(HiCacheStorage):
             if exist_result[i] != 1:
                 return i // key_multiplier
         return len(query_keys) // key_multiplier
+
+    def batch_exists_extra(
+        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
+        if self.extra_backend_tag is not None:
+            prefix = self.extra_backend_tag
+            keys = [f"{prefix}_{key}" for key in keys]
+        query_keys = self._get_extra_keys_for_nsa(keys)
+        exist_result = self._batch_exist(query_keys)
+        for i in range(len(query_keys)):
+            if exist_result[i] != 1:
+                return i
+        return len(query_keys)
 
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
