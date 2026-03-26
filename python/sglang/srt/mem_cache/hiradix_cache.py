@@ -21,15 +21,22 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
+    HostPoolGroup,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+    NSAIndexerPoolHost,
     NSATokenToKVPoolHost,
+    PoolEntry,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -76,14 +83,8 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
-            self.token_to_kv_pool_host = NSATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            )
+            # NSA: defer to _build_nsa_hybrid_stack after extra_config is parsed
+            self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
@@ -118,21 +119,29 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        self.cache_controller = HiCacheController(
-            params.token_to_kv_pool_allocator,
-            self.token_to_kv_pool_host,
-            self.page_size,
-            self.tp_group,
-            load_cache_event=self.load_cache_event,
-            write_policy=server_args.hicache_write_policy,
-            io_backend=server_args.hicache_io_backend,
-            storage_backend=server_args.hicache_storage_backend,
-            prefetch_threshold=prefetch_threshold,
-            model_name=server_args.served_model_name,
-            storage_backend_extra_config=extra_config,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-        )
+        if isinstance(self.kv_cache, NSATokenToKVPool):
+            self._build_nsa_hybrid_stack(
+                params,
+                server_args,
+                extra_config=extra_config,
+                prefetch_threshold=prefetch_threshold,
+            )
+        else:
+            self.cache_controller = HiCacheController(
+                params.token_to_kv_pool_allocator,
+                self.token_to_kv_pool_host,
+                self.page_size,
+                self.tp_group,
+                load_cache_event=self.load_cache_event,
+                write_policy=server_args.hicache_write_policy,
+                io_backend=server_args.hicache_io_backend,
+                storage_backend=server_args.hicache_storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=extra_config,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+            )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,
@@ -178,6 +187,75 @@ class HiRadixCache(RadixCache):
                 self.detach_storage_backend()
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
+
+    def _build_nsa_hybrid_stack(
+        self, params, server_args, *, extra_config, prefetch_threshold
+    ):
+        """Build HostPoolGroup (KV + indexer) + HybridCacheController for NSA."""
+        kv = self.kv_cache
+        mla_host = MLATokenToKVPoolHost(
+            kv,
+            server_args.hicache_ratio,
+            server_args.hicache_size,
+            self.page_size,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+            override_kv_cache_dim=kv.kv_cache_dim,
+        )
+        indexer_host = NSAIndexerPoolHost(
+            kv,
+            mla_host,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        layer_num = kv.layer_num
+
+        def layer_mapper(layer_id: int):
+            if 0 <= layer_id < layer_num:
+                return layer_id
+            return None
+
+        host_pool_group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=mla_host,
+                    device_pool=kv,
+                    layer_mapper=layer_mapper,
+                    is_primary_index_anchor=True,
+                ),
+                PoolEntry(
+                    name=PoolName.INDEXER,
+                    host_pool=indexer_host,
+                    device_pool=kv,
+                    layer_mapper=layer_mapper,
+                    share_indices_with_anchor=True,
+                ),
+            ]
+        )
+        self.token_to_kv_pool_host = host_pool_group
+        self.cache_controller = HybridCacheController(
+            params.token_to_kv_pool_allocator,
+            host_pool_group,
+            self.page_size,
+            self.tp_group,
+            load_cache_event=self.load_cache_event,
+            write_policy=server_args.hicache_write_policy,
+            io_backend=server_args.hicache_io_backend,
+            storage_backend=server_args.hicache_storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            model_name=server_args.served_model_name,
+            storage_backend_extra_config=extra_config,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            transfer_layer_num=layer_num,
+            enable_storage_metrics=self.enable_storage_metrics,
+        )
+        logger.info(
+            "NSA hierarchical cache: HostPoolGroup(KV + INDEXER), "
+            "HybridCacheController, transfer_layer_num=%s",
+            layer_num,
+        )
 
     def _apply_storage_runtime_config(
         self,

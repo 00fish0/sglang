@@ -2,7 +2,8 @@ import hashlib
 import logging
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, List, Optional
 
 import torch
@@ -50,8 +51,11 @@ class HiCacheStorageConfig:
     pp_rank: int
     pp_size: int
     is_mla_model: bool
+    enable_storage_metrics: bool
     is_page_first_layout: bool
     model_name: Optional[str]
+    tp_lcm_size: Optional[int] = None
+    should_split_heads: bool = False
     extra_config: Optional[dict] = None
 
 
@@ -59,6 +63,102 @@ class HiCacheStorageConfig:
 class HiCacheStorageExtraInfo:
     prefix_keys: Optional[List[str]] = (None,)
     extra_info: Optional[dict] = None
+
+
+# ---------------------------------------------------------------------------
+# Pool transfer descriptors (for HybridCacheController / multi-pool support)
+# ---------------------------------------------------------------------------
+
+
+class PoolName(str, Enum):
+    """Well-known pool names used as PoolTransfer/PoolEntry identifiers."""
+
+    KV = "kv"
+    MAMBA = "mamba"
+    INDEXER = "indexer"
+
+
+class PoolHitPolicy(str, Enum):
+    """Hit policy for batch_exists_v2 per-pool prefix matching.
+
+    ALL_PAGES      : every page in [0, kv_hit) must exist (e.g. DSA).
+    TRAILING_PAGES : only the last N pages must exist (e.g. Mamba/SWA states).
+    """
+
+    ALL_PAGES = "all_pages"
+    TRAILING_PAGES = "trailing_pages"
+
+
+@dataclass
+class PoolTransfer:
+    """Unified per-pool transfer descriptor for batch v2 interface.
+
+    device<->host path : host_indices + device_indices
+    host<->storage path: host_indices + keys
+    """
+
+    name: PoolName
+    host_indices: Optional[torch.Tensor] = None
+    device_indices: Optional[torch.Tensor] = None
+    keys: Optional[List[str]] = None
+    hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+
+
+@dataclass
+class PoolTransferResult:
+    """Tracks how many pages were successfully processed per pool."""
+
+    kv_hit_pages: int
+    extra_pool_hit_pages: dict = field(default_factory=dict)
+
+    @classmethod
+    def empty(cls) -> "PoolTransferResult":
+        return cls(0, {})
+
+    def update_kv_hit_pages(self, kv_hit_pages: int) -> None:
+        self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
+
+    def update_extra_pool_hit_pages(self, results: dict) -> None:
+        self.extra_pool_hit_pages.update(
+            {name: sum(rs) for name, rs in results.items()}
+        )
+
+
+class NSAExtraStorageMixin:
+    """Mixin for storage backends that support NSA indexer extra data."""
+
+    _NSA_INDEXER_SUFFIX = "__nsa_idx"
+
+    def register_mem_host_pool_v2(
+        self, host_pool: HostKVCache, host_pool_name: "PoolName"
+    ):
+        """Register additional host pools for multi-pool zero-copy I/O."""
+        raise NotImplementedError
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        """Check existence with per-pool hit policies."""
+        raise NotImplementedError
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        """Read data for each PoolTransfer. Returns {pool_name: [bool]}."""
+        raise NotImplementedError
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        """Write data for each PoolTransfer. Returns {pool_name: [bool]}."""
+        raise NotImplementedError
 
 
 class HiCacheStorage(ABC):

@@ -15,6 +15,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    NSAExtraStorageMixin,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.metrics.collector import StorageMetrics
@@ -222,7 +227,7 @@ class MooncakeStoreConfig:
         )
 
 
-class MooncakeStore(HiCacheStorage):
+class MooncakeStore(NSAExtraStorageMixin, HiCacheStorage):
 
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
@@ -425,6 +430,136 @@ class MooncakeStore(HiCacheStorage):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+
+    # ------------------------------------------------------------------
+    # v2 multi-pool interface (for HybridCacheController / NSA indexer)
+    # ------------------------------------------------------------------
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if not hasattr(self, "registered_pools"):
+            self.registered_pools = {}
+        self.registered_pools[host_pool_name] = host_pool
+        if host_pool_name == PoolName.KV:
+            return
+        assert getattr(host_pool, "get_hybrid_pool_buffer", None) is not None
+        buf_list = host_pool.get_hybrid_pool_buffer()
+        for buf in buf_list:
+            buf_ptr = buf.data_ptr()
+            buf_size = buf.numel() * buf.element_size()
+            logger.info(
+                f"Registering hybrid pool buffer ({host_pool_name}): "
+                f"ptr=0x{buf_ptr:x}, size={buf_size} ({buf_size / (1 << 30):.2f} GB)"
+            )
+            ret_code = self.store.register_buffer(buf_ptr, buf_size)
+            if ret_code:
+                raise RuntimeError(
+                    f"Failed to register hybrid pool buffer ({host_pool_name}), "
+                    f"error code: {ret_code}"
+                )
+
+    def _tag_keys(self, keys: List[str]) -> List[str]:
+        if self.extra_backend_tag is None:
+            return keys
+        return [f"{self.extra_backend_tag}_{key}" for key in keys]
+
+    def _get_hybrid_page_component_keys(
+        self, page_keys: List[str], transfer: PoolTransfer
+    ):
+        name = transfer.name
+        component_keys = []
+        key_multiplier = 0
+        for page_key in page_keys:
+            if name == PoolName.INDEXER:
+                key_multiplier = 1
+                component_keys.append(
+                    f"{page_key}_{self.mla_suffix}_{PoolName.INDEXER}"
+                )
+        return component_keys, key_multiplier
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        qkeys = self._tag_keys(keys)
+        kv_pages = self.batch_exists(qkeys, extra_info)
+        final_pages = kv_pages
+
+        for transfer in pool_transfers or []:
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                component_keys, key_multiplier = (
+                    self._get_hybrid_page_component_keys(qkeys[:kv_pages], transfer)
+                )
+                if not component_keys:
+                    continue
+                exist_result = self._batch_exist(component_keys)
+                for i in range(kv_pages):
+                    base = i * key_multiplier
+                    group = exist_result[base : base + key_multiplier]
+                    if not all(r == 1 for r in group):
+                        final_pages = i
+                        break
+
+        return PoolTransferResult(kv_hit_pages=final_pages, extra_pool_hit_pages={})
+
+    def _batch_io_v2(
+        self, transfers: List[PoolTransfer], is_set: bool
+    ) -> dict:
+        results = {}
+        for transfer in transfers:
+            pool = self.registered_pools.get(transfer.name)
+            if pool is None or transfer.keys is None or transfer.host_indices is None:
+                continue
+            page_keys = self._tag_keys(transfer.keys)
+            component_keys, key_multiplier = (
+                self._get_hybrid_page_component_keys(page_keys, transfer)
+            )
+            if not component_keys:
+                continue
+            ptr_list, size_list = pool.get_page_buffer_meta(transfer.host_indices)
+            if is_set:
+                exist_result = self._batch_exist(component_keys)
+                set_keys, set_ptrs, set_sizes, set_indices = [], [], [], []
+                set_results = [-1] * len(component_keys)
+                for i, k in enumerate(component_keys):
+                    if exist_result[i] != 1:
+                        set_keys.append(k)
+                        set_ptrs.append(ptr_list[i])
+                        set_sizes.append(size_list[i])
+                        set_indices.append(i)
+                    else:
+                        set_results[i] = 0
+                if set_keys:
+                    put_ret = self._put_batch_zero_copy_impl(
+                        set_keys, set_ptrs, set_sizes
+                    )
+                    for j, idx in enumerate(set_indices):
+                        set_results[idx] = put_ret[j]
+                ok = [r == 0 for r in set_results]
+            else:
+                get_ret = self._get_batch_zero_copy_impl(
+                    component_keys, ptr_list, size_list
+                )
+                ok = [r > 0 for r in get_ret]
+            results[transfer.name] = ok
+        return results
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=False)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=True)
+
+    # ------------------------------------------------------------------
 
     def _get_mha_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
